@@ -1,0 +1,183 @@
+name: "Terraform Plan"
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  lint:
+    name: "Lint"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: terraform-linters/setup-tflint@b480b8fcdaa6f2c577f8e4fa799e89e756bb7c93 # v6
+        name: Setup TFLint
+        with:
+          tflint_version: latest
+
+      - name: Init TFLint
+        run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Show version
+        run: tflint --version
+
+      - name: Run TFLint
+        id: tflint
+        run: tflint --minimum-failure-severity=error --format=compact
+  scan:
+    name: "Scan"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Run Trivy vulnerability scanner in IaC mode
+      id: trivy
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      with:
+        scan-type: 'config'
+        hide-progress: true
+        format: 'table'
+        exit-code: '1'
+        severity: 'CRITICAL,HIGH,MEDIUM'
+  
+  terraform_dev:
+    name: "Terraform Dev"
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency:
+      group: dev_environment
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+      pull-requests: write
+    env:
+      VAR_FILE: ${{ vars.VAR_FILE }}
+      BACKEND_FILE: ${{ vars.BACKEND_FILE }}
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_USE_OIDC: true
+      STATE_RG: ${{ secrets.STATE_RESOURCE_GROUP }}
+      STATE_ST: ${{ secrets.STATE_STORAGE_ACCOUNT }}
+    defaults:
+      run:
+        shell: bash
+    needs: [lint, scan]
+    if: |
+      always() &&
+      (needs.lint.result == 'success' || needs.lint.result == 'skipped') &&
+      (needs.scan.result == 'success' || needs.scan.result == 'skipped')
+    steps:
+    - name: Azure login
+      uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Whitelist GitHub Runner IP
+      uses: azure/CLI@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2
+      with:
+        azcliversion: latest
+        inlineScript: |
+          set -eu
+          agentIP=$(curl -s https://api.ipify.org/)
+          az storage account network-rule add \
+            --resource-group "${{ secrets.STATE_RESOURCE_GROUP }}" \
+            --account-name "${{ secrets.STATE_STORAGE_ACCOUNT }}" \
+            --ip-address $agentIP
+          sleep 30
+
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4
+
+    - name: Terraform Init
+      id: init
+      run: terraform init -backend-config=./environments/$BACKEND_FILE
+
+    - name: Terraform Format
+      id: fmt
+      run: terraform fmt -check -diff
+
+    - name: Terraform Validate
+      id: validate
+      run: terraform validate -no-color
+
+    - name: Terraform Plan
+      id: plan
+      run: terraform plan -var-file=./environments/$VAR_FILE -input=false -no-color
+
+    - name: Remove GitHub Runner IP from Whitelist
+      if: always()
+      uses: azure/CLI@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2
+      with:
+        azcliversion: latest
+        inlineScript: |
+          set -eu
+          agentIP=$(curl -s https://api.ipify.org/)
+          az storage account network-rule remove  \
+            --resource-group "${{ secrets.STATE_RESOURCE_GROUP }}" \
+            --account-name "${{ secrets.STATE_STORAGE_ACCOUNT }}" \
+            --ip-address $agentIP
+
+    - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      if:
+        (github.event_name == 'pull_request')
+      env:
+        PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+          <details><summary>Validation Output</summary>
+
+          \`\`\`\n
+          ${{ steps.validate.outputs.stdout }}
+          \`\`\`
+
+          </details>
+
+          #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+          <details><summary>Show Plan</summary>
+
+          \`\`\`\n
+          ${process.env.PLAN}
+          \`\`\`
+
+          </details>
+
+          *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.tf_actions_working_dir }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })

@@ -1,0 +1,5 @@
+resource_group_name  = "rg-state-nc-pdt5nx"
+storage_account_name = "ststatencpdt5nx"
+container_name       = "tfstate"
+key                  = "dev.tfstate"
+use_azuread_auth     = true
